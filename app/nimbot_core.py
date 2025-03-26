@@ -73,6 +73,17 @@ def crawl_site(start_url):
     return collected_docs
 
 
+def clear_redis_index(redis_client, index_name):
+    print(f"🧹 Clearing Redis index: {index_name}")
+    pattern = f"doc:{index_name}:*"
+    keys = redis_client.keys(pattern)
+    if keys:
+        redis_client.delete(*keys)
+        print(f"🗑️ Deleted {len(keys)} old vectors from Redis.")
+    else:
+        print("📭 No existing vectors to delete.")
+
+
 def get_vectorstore(docs):
     embedding = OpenAIEmbeddings()
 
@@ -81,6 +92,7 @@ def get_vectorstore(docs):
         r = redis.Redis.from_url(redis_url)
         r.ping()
         print("🧠 Connected to Redis, using Redis as vector store.")
+        clear_redis_index(r, redis_index_name)
         return Redis.from_documents(
             documents=docs,
             embedding=embedding,
