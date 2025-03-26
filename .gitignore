@@ -1,0 +1,4 @@
+.envrc
+.mypy_cache
+dump.rdb
+faiss_index

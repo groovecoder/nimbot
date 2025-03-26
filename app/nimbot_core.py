@@ -8,24 +8,26 @@ import redis
 from langchain.chains import RetrievalQA
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
 from langchain_community.vectorstores import FAISS, Redis
-
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai.chat_models import ChatOpenAI
 
 
+# configs from env
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-redis_index_name = "nimbox-index"
+start_url = os.environ.get("START_URL", "https://experimenter.info/")
+user_agent = os.environ.get("USER_AGENT", "nimbot/1.0 (+https://github.com/groovecoder/nimbot)")
+max_pages = os.environ.get("MAX_PAGES", 1000)
 
+# static configs
+redis_index_name = "nimbot-index"
+faiss_path="faiss_index"
+headers = {"User-Agent": user_agent}
 
-def crawl_site(start_url, max_pages=1000):
+def crawl_site(start_url):
     visited = set()
     to_visit = [start_url]
     collected_docs = []
-    headers = {
-        "User-Agent": os.environ.get("USER_AGENT", "requests")
-    }
 
     print("🕸 Starting crawl ...")
     while to_visit and len(visited) < max_pages:
@@ -59,7 +61,7 @@ def crawl_site(start_url, max_pages=1000):
                 print(f"⏭ Skipping article shorter than 100: {url}")
                 continue
 
-            title = soup.title.string.strip() if soup.title and soup.title.string else "Unntitled"
+            title = soup.title.string.strip() if soup.title and soup.title.string else "Untitled"
             doc_dict = {"url": url, "title": title, "text": page_text}
             collected_docs.append(doc_dict)
             print(f"✅ Added article: {title[:60]}...")
@@ -70,15 +72,8 @@ def crawl_site(start_url, max_pages=1000):
     print(f"\n✅ Finished crawling. Collected {len(collected_docs)} pages.\n")
     return collected_docs
 
-docs = crawl_site("https://experimenter.info/", max_pages=1000)
-print("🧱 Converting crawled data into LangChain documents...")
-lc_docs = [Document(page_content=doc["text"], metadata={"source": doc["url"], "title": doc["title"]}) for doc in docs]
-print("✂️ Splitting documents into chunks...")
-splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-split_docs = splitter.split_documents(lc_docs)
-print(f"📚 Created {len(split_docs)} chunks from {len(lc_docs)} documents.\n")
 
-def get_vectorstore(docs, redis_url="redis://localhost:6379", index_name="nimbot-index", faiss_path="faiss_index"):
+def get_vectorstore(docs):
     embedding = OpenAIEmbeddings()
 
     # Try connecting to Redis
@@ -90,7 +85,7 @@ def get_vectorstore(docs, redis_url="redis://localhost:6379", index_name="nimbot
             documents=docs,
             embedding=embedding,
             redis_url=redis_url,
-            index_name=index_name
+            index_name=redis_index_name
         )
     except redis.exceptions.ConnectionError:
         print("⚠️ Redis not available, falling back to FAISS.")
@@ -107,27 +102,22 @@ def get_vectorstore(docs, redis_url="redis://localhost:6379", index_name="nimbot
     print(f"💾 Saved FAISS index to {faiss_path}")
     return faiss_store
 
-print("📊 Loading vector store...")
-vectorstore = get_vectorstore(lc_docs, redis_url=redis_url, index_name=redis_index_name)
+def build_qa_chain():
+    doc_dicts = crawl_site("https://experimenter.info/")
+    print("🧱 Converting crawled data into LangChain documents...")
+    lc_docs = [Document(page_content=doc["text"], metadata={"source": doc["url"], "title": doc["title"]}) for doc in doc_dicts]
+    print("✂️ Splitting documents into chunks...")
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    split_docs = splitter.split_documents(lc_docs)
+    print(f"📚 Created {len(split_docs)} chunks from {len(lc_docs)} documents.\n")
+    print("📊 Loading vector store...")
+    vectorstore = get_vectorstore(lc_docs)
+    retriever = vectorstore.as_retriever(search_kwargs={"distance_threshold": 0.3})
 
-print("💬 Setting up the LLM + retrieval chain...\n")
-llm = ChatOpenAI(model="gpt-4")
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=vectorstore.as_retriever(
-        search_kwargs={"distance_threshold": 0.3}
-    ),
-    return_source_documents=True
-)
-
-print("Nimbot is ready! Ask your questions below...\n")
-while True:
-    question = input("💬 Ask nimbot (or type 'exit'): ")
-    if question.lower() == "exit":
-        break
-    response = qa_chain.invoke({"query":question})
-    print("🤖 Nimbot says:\n")
-    print(response["result"])
-    print("🕸 Sources:")
-    for doc in response["source_documents"]:
-        print("-", doc.metadata.get("source"))
+    print("💬 Setting up the LLM + retrieval chain...\n")
+    llm = ChatOpenAI(model="gpt-4")
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        return_source_documents=True
+    )
