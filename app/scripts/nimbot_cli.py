@@ -2,10 +2,10 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from app.nimbot_core import build_qa_chain
+from app.nimbot_core import build_qa_chains, invoke_with_fallback
 
 print("🧠 Loading Nimbot... (this may take a moment)")
-qa_chain = build_qa_chain()
+build_qa_chains()
 
 print("🤖 Nimbot is ready! Ask your questions below...\n")
 
@@ -16,7 +16,7 @@ while True:
         break
 
     try:
-        response = qa_chain.invoke({"query": question})
+        response = invoke_with_fallback(question)
         print("\n🤖 Nimbot says:\n")
         print(response["result"])
 

@@ -24,6 +24,10 @@ redis_index_name = "nimbot-index"
 faiss_path="faiss_index"
 headers = {"User-Agent": user_agent}
 
+# qa chains
+qa_chain_35 = None
+qa_chain_4 = None
+
 def crawl_site(start_url):
     visited = set()
     to_visit = [start_url]
@@ -114,7 +118,8 @@ def get_vectorstore(docs):
     print(f"💾 Saved FAISS index to {faiss_path}")
     return faiss_store
 
-def build_qa_chain():
+def build_qa_chains():
+    global qa_chain_35, qa_chain_4
     doc_dicts = crawl_site("https://experimenter.info/")
     print("🧱 Converting crawled data into LangChain documents...")
     lc_docs = [Document(page_content=doc["text"], metadata={"source": doc["url"], "title": doc["title"]}) for doc in doc_dicts]
@@ -124,12 +129,49 @@ def build_qa_chain():
     print(f"📚 Created {len(split_docs)} chunks from {len(lc_docs)} documents.\n")
     print("📊 Loading vector store...")
     vectorstore = get_vectorstore(lc_docs)
-    retriever = vectorstore.as_retriever(search_kwargs={"distance_threshold": 0.3})
 
     print("💬 Setting up the LLM + retrieval chain...\n")
-    llm = ChatOpenAI(model="gpt-4")
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
+    # gpt3.5 is cheaper: get more chunks even with lower similarity
+    retriever35 = vectorstore.as_retriever(
+        search_kwargs={
+            "k": 5,
+            "distance_threshold": 0.4
+        }
+    )
+    qa_chain_35 = RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(model="gpt-3.5-turbo"),
+        retriever=retriever35,
         return_source_documents=True
     )
+
+    # gpt4 💸: get fewer chunks with higher similarity
+    retriever4 = vectorstore.as_retriever(
+        search_kwargs={
+            "k": 3,
+            "distance_threshold": 0.3
+        }
+    )
+    qa_chain_4 = RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(model="gpt-4"),
+        retriever=retriever4,
+        return_source_documents=True
+    )
+
+    return qa_chain_35, qa_chain_4
+
+def invoke_with_fallback(query, force_gpt4=False):
+    if force_gpt4:
+        print("⚡️ Forcing GPT-4 ...")
+        return qa_chain_4.invoke({"query": query})
+
+    response_35 = qa_chain_35.invoke({"query": query})
+    answer = response_35["result"]
+
+    fallback_phrases = ["I'm not sure", "I don't know", "cannot find", "not enough context"]
+    low_confidence = any(phrase in answer.lower() for phrase in fallback_phrases) or len(answer.strip()) < 40
+
+    if low_confidence:
+        print("🪂 GPT-3.5 was unsure, retrying with GPT-4...")
+        return qa_chain_4.invoke({"query": query})
+
+    return response_35
