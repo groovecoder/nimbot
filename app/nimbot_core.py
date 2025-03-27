@@ -5,10 +5,11 @@ import requests
 from bs4 import BeautifulSoup
 import redis
 
-from langchain.chains import RetrievalQA
+from langchain.chains import RetrievalQA, StuffDocumentsChain, LLMChain
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS, Redis
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai.chat_models import ChatOpenAI
 
@@ -17,7 +18,7 @@ from langchain_openai.chat_models import ChatOpenAI
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
 start_url = os.environ.get("START_URL", "https://experimenter.info/")
 user_agent = os.environ.get("USER_AGENT", "nimbot/1.0 (+https://github.com/groovecoder/nimbot)")
-max_pages = os.environ.get("MAX_PAGES", 1000)
+max_pages = int(os.environ.get("MAX_PAGES", 1000))
 
 # static configs
 redis_index_name = "nimbot-index"
@@ -118,6 +119,38 @@ def get_vectorstore(docs):
     print(f"💾 Saved FAISS index to {faiss_path}")
     return faiss_store
 
+
+def build_combine_chain_gpt35():
+    # Format each document as raw text
+    document_prompt = PromptTemplate(
+        input_variables=["page_content"],
+        template="{page_content}"
+    )
+
+    # Prompt that wraps all retrieved chunks
+    combine_prompt = PromptTemplate.from_template("""
+You are a helpful assistant answering questions about Firefox Experimenter.
+
+Answer the question using only the context below. If the answer cannot be found in the context, say "I don't know."
+
+Context:
+{context}
+
+Question: {question}
+""")
+
+    llm_chain = LLMChain(
+        llm=ChatOpenAI(model="gpt-3.5-turbo"),
+        prompt=combine_prompt
+    )
+
+    return StuffDocumentsChain(
+        llm_chain=llm_chain,
+        document_prompt=document_prompt,
+        document_variable_name="context"
+    )
+
+
 def build_qa_chains():
     global qa_chain_35, qa_chain_4
     doc_dicts = crawl_site("https://experimenter.info/")
@@ -132,23 +165,13 @@ def build_qa_chains():
 
     print("💬 Setting up the LLM + retrieval chain...\n")
     # gpt3.5 is cheaper: get more chunks even with lower similarity
-    retriever35 = vectorstore.as_retriever(
-        search_kwargs={
-            "k": 5,
-            "distance_threshold": 0.4
-        }
-    )
-    qa_chain_35 = RetrievalQA.from_chain_type(
-        llm=ChatOpenAI(model="gpt-3.5-turbo"),
-        retriever=retriever35,
-        return_source_documents=True
-    )
+    qa_chain_35 = build_combine_chain_gpt35()
 
     # gpt4 💸: get fewer chunks with higher similarity
     retriever4 = vectorstore.as_retriever(
         search_kwargs={
             "k": 3,
-            "distance_threshold": 0.3
+            "distance_threshold": 0.2
         }
     )
     qa_chain_4 = RetrievalQA.from_chain_type(
@@ -159,19 +182,40 @@ def build_qa_chains():
 
     return qa_chain_35, qa_chain_4
 
-def invoke_with_fallback(query, force_gpt4=False):
+def invoke_with_fallback(query, force_gpt4=False, score_threshold=0.75, max_docs=5):
     if force_gpt4:
         print("⚡️ Forcing GPT-4 ...")
         return qa_chain_4.invoke({"query": query})
 
-    response_35 = qa_chain_35.invoke({"query": query})
-    answer = response_35["result"]
+    print("🧠 Running similarity search with scores ...")
+    results = qa_chain_4.retriever.vectorstore.similarity_search_with_relevance_scores(
+        query=query,
+        k=max_docs
+    )
 
-    fallback_phrases = ["I'm not sure", "I don't know", "cannot find", "not enough context"]
-    low_confidence = any(phrase in answer.lower() for phrase in fallback_phrases) or len(answer.strip()) < 40
+    if not results:
+        print("⚠️ No relevant documents found - using GPT-4.")
+        return qa_chain_4.invoke({"query": query})
+
+    docs_with_scores = [(doc, score) for doc, score in results if score >= score_threshold]
+
+    if not docs_with_scores:
+        print("⚠️ All retrieved chunks had low similarity - using GPT-4.")
+        return qa_chain_4.invoke({"query": query})
+
+    print(f"✅ {len(docs_with_scores)} documents passed relevance threshold (≥ {score_threshold})")
+
+    context_docs = [doc for doc, _ in docs_with_scores]
+    response_35 = qa_chain_35.run(input_documents=context_docs, question=query)
+
+    fallback_phrases = ["Unfortunately", "I'm not sure", "I don't know", "cannot find", "not enough context", "do not have specific", "no specific"]
+    low_confidence = any(phrase in response_35.lower() for phrase in fallback_phrases) or len(response_35.strip()) < 40
 
     if low_confidence:
         print("🪂 GPT-3.5 was unsure, retrying with GPT-4...")
         return qa_chain_4.invoke({"query": query})
 
-    return response_35
+    return {
+        "result": response_35,
+        "source_documents": context_docs
+    }
